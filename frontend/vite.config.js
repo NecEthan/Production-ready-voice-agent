@@ -6,6 +6,8 @@ export default defineConfig({
   server: {
     proxy: {
       "/token": "http://localhost:8080",
+      "/auth": "http://localhost:8080",
+      "/appointments": "http://localhost:8080",
     },
   },
 });

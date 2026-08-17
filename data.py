@@ -1,7 +1,9 @@
 """
-In-memory data store — peptide inventory and FAQs.
+In-memory data store — peptide inventory, FAQs, and appointments.
 Replace with a real database in production.
 """
+import uuid
+from datetime import date, timedelta
 
 # ------------------------------------------------------------------
 # Peptide stock
@@ -160,3 +162,53 @@ FAQS: dict[str, str] = {
         "Shipping is $25 flat rate or free on orders over $300."
     ),
 }
+
+# ------------------------------------------------------------------
+# Appointment types
+# ------------------------------------------------------------------
+APPOINTMENT_TYPES: dict[str, dict] = {
+    "initial_consultation": {
+        "label": "Initial Consultation",
+        "duration_min": 60,
+        "price": 150,
+    },
+    "follow_up": {
+        "label": "Follow-Up Visit",
+        "duration_min": 30,
+        "price": 75,
+    },
+    "peptide_review": {
+        "label": "Peptide Protocol Review",
+        "duration_min": 30,
+        "price": 75,
+    },
+    "lab_review": {
+        "label": "Lab Results Review",
+        "duration_min": 45,
+        "price": 100,
+    },
+}
+
+# ------------------------------------------------------------------
+# Available slots — pre-populated for the next 7 business days.
+# Key format: "YYYY-MM-DD HH:MM"
+# ------------------------------------------------------------------
+def _generate_slots() -> dict[str, bool]:
+    """Generate morning and afternoon slots for the next 7 business days."""
+    slots: dict[str, bool] = {}
+    times = ["09:00", "10:00", "11:00", "13:00", "14:00", "15:00", "16:00"]
+    today = date.today()
+    days_added = 0
+    check_day = today + timedelta(days=1)  # start tomorrow
+    while days_added < 7:
+        if check_day.weekday() < 5:  # Mon–Fri
+            for t in times:
+                slots[f"{check_day.isoformat()} {t}"] = True  # True = available
+            days_added += 1
+        check_day += timedelta(days=1)
+    return slots
+
+
+AVAILABLE_SLOTS: dict[str, bool] = _generate_slots()
+
+# Appointments are now stored in SQLite via models.Appointment.
