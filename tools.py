@@ -2,7 +2,6 @@ import uuid
 from typing import Annotated
 
 from livekit.agents import function_tool
-from sqlalchemy.orm import Session
 
 import data
 
@@ -52,72 +51,73 @@ async def check_peptide_stock(
     )
 
 
-@function_tool(
-    description=(
-        "Check available appointment slots. "
-        "Pass a date string 'YYYY-MM-DD' to see slots for that day, "
-        "or pass 'next' to get the next available slot, "
-        "or pass 'week' to list all available slots in the next 7 business days. "
-        "Also accepts appointment type to show price/duration: "
-        "initial_consultation, follow_up, peptide_review, lab_review."
+def make_check_available_slots(db: Session):
+    """Return a check_available_slots tool with DB-backed booked slot exclusion."""
+
+    @function_tool(
+        description=(
+            "Check available appointment slots. "
+            "Pass a date string 'YYYY-MM-DD' to see slots for that day, "
+            "or pass 'next' to get the next available slot, "
+            "or pass 'week' to list all available slots in the next 7 business days. "
+            "Also accepts appointment type to show price/duration: "
+            "initial_consultation, follow_up, peptide_review, lab_review."
+        )
     )
-)
-async def check_available_slots(
-    query: Annotated[
-        str,
-        "Date 'YYYY-MM-DD', 'next', or 'week'. Optionally prefix with appointment type, e.g. 'follow_up 2025-09-10'.",
-    ],
-    db: Session = None,
-) -> str:
-    parts = query.strip().lower().split()
+    async def check_available_slots(
+        query: Annotated[
+            str,
+            "Date 'YYYY-MM-DD', 'next', or 'week'. Optionally prefix with appointment type, e.g. 'follow_up 2025-09-10'.",
+        ],
+    ) -> str:
+        parts = query.strip().lower().split()
 
-    appt_type = None
-    date_query = query.strip()
-    for key in data.APPOINTMENT_TYPES:
-        if parts[0] == key:
-            appt_type = key
-            date_query = " ".join(parts[1:]) if len(parts) > 1 else "week"
-            break
+        appt_type = None
+        date_query = query.strip()
+        for key in data.APPOINTMENT_TYPES:
+            if parts[0] == key:
+                appt_type = key
+                date_query = " ".join(parts[1:]) if len(parts) > 1 else "week"
+                break
 
-    type_info = ""
-    if appt_type:
-        t = data.APPOINTMENT_TYPES[appt_type]
-        type_info = f"{t['label']} ({t['duration_min']} min, ${t['price']}). "
+        type_info = ""
+        if appt_type:
+            t = data.APPOINTMENT_TYPES[appt_type]
+            type_info = f"{t['label']} ({t['duration_min']} min, ${t['price']}). "
 
-    # Derive booked slots from DB if session available
-    booked_slots: set[str] = set()
-    if db is not None:
         from models import Appointment
         booked_slots = {a.slot for a in db.query(Appointment.slot).all()}
 
-    available = {
-        slot: v
-        for slot, v in data.AVAILABLE_SLOTS.items()
-        if v and slot not in booked_slots
-    }
+        available = {
+            slot: v
+            for slot, v in data.AVAILABLE_SLOTS.items()
+            if v and slot not in booked_slots
+        }
 
-    if not available:
-        return type_info + "No available slots in the next 7 business days."
+        if not available:
+            return type_info + "No available slots in the next 7 business days."
 
-    dq = date_query.strip().lower()
+        dq = date_query.strip().lower()
 
-    if dq == "next":
-        slot = sorted(available.keys())[0]
-        return type_info + f"Next available slot: {slot}."
+        if dq == "next":
+            slot = sorted(available.keys())[0]
+            return type_info + f"Next available slot: {slot}."
 
-    if dq == "week":
-        grouped: dict[str, list[str]] = {}
-        for slot in sorted(available.keys()):
-            day, time = slot.split(" ")
-            grouped.setdefault(day, []).append(time)
-        lines = [f"{day}: {', '.join(times)}" for day, times in grouped.items()]
-        return type_info + "Available slots:\n" + "\n".join(lines)
+        if dq == "week":
+            grouped: dict[str, list[str]] = {}
+            for slot in sorted(available.keys()):
+                day, time = slot.split(" ")
+                grouped.setdefault(day, []).append(time)
+            lines = [f"{day}: {', '.join(times)}" for day, times in grouped.items()]
+            return type_info + "Available slots:\n" + "\n".join(lines)
 
-    day_slots = sorted(s for s in available if s.startswith(dq))
-    if not day_slots:
-        return type_info + f"No available slots on {dq}. Try 'week' to see all open days."
-    times = [s.split(" ")[1] for s in day_slots]
-    return type_info + f"Available on {dq}: {', '.join(times)}."
+        day_slots = sorted(s for s in available if s.startswith(dq))
+        if not day_slots:
+            return type_info + f"No available slots on {dq}. Try 'week' to see all open days."
+        times = [s.split(" ")[1] for s in day_slots]
+        return type_info + f"Available on {dq}: {', '.join(times)}."
+
+    return check_available_slots
 
 
 @function_tool(

@@ -14,10 +14,10 @@ from livekit.plugins import openai, silero
 from database import SessionLocal
 from tools import (
     answer_faq,
-    check_available_slots,
     check_peptide_stock,
     make_book_appointment,
     make_cancel_appointment,
+    make_check_available_slots,
     make_get_appointments,
 )
 
@@ -62,7 +62,7 @@ class ReceptionistAgent(Agent):
             tools=[
                 check_peptide_stock,
                 answer_faq,
-                check_available_slots,
+                make_check_available_slots(db),
                 make_book_appointment(user_id, db),
                 make_cancel_appointment(user_id, db),
                 make_get_appointments(user_id, db),
