@@ -15,7 +15,9 @@ from livekit.agents import (
 from livekit.plugins import openai, silero
 
 import guardrails
+from cost_tracker import SessionCostTracker
 from database import SessionLocal
+from rate_limiter import check_session_rate
 from tools import (
     answer_faq,
     check_peptide_stock,
@@ -123,13 +125,22 @@ async def entrypoint(ctx: JobContext) -> None:
     except (ValueError, AttributeError):
         return  # Reject unauthenticated or tampered participant identities
 
+    if not await check_session_rate(user_id):
+        return  # Rate limit exceeded — participant gets dead air then drops
+
     db = SessionLocal()
+    cost = SessionCostTracker(user_id=user_id)
     try:
         session = AgentSession(
             stt=openai.STT(),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(voice="alloy"),
             vad=silero.VAD.load(min_silence_duration=0.3),
+        )
+
+        session.on(
+            "session_usage_updated",
+            lambda ev: cost.update(ev.usage.model_usage),
         )
 
         await session.start(
@@ -149,6 +160,7 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.exception("Agent session failed for user %s", user_id)
         raise
     finally:
+        cost.log_summary()
         db.close()
 
 
