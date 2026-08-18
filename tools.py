@@ -1,8 +1,11 @@
+import asyncio
+import functools
 import re
 import uuid as _uuid
 from typing import Annotated
 
 from livekit.agents import function_tool
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 import data
@@ -26,6 +29,41 @@ def _truncate(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool guard: per-call timeout + retry on transient DB errors
+# ---------------------------------------------------------------------------
+
+_TOOL_TIMEOUT = 8.0   # seconds per attempt
+_TOOL_RETRIES = 2     # retries on OperationalError (e.g. SQLite db locked)
+_RETRY_BACKOFF = 0.3  # seconds; doubles each attempt
+
+
+def tool_guard(timeout: float = _TOOL_TIMEOUT, retries: int = _TOOL_RETRIES):
+    """Wrap an async tool: timeout per attempt, retry on transient DB errors.
+
+    Apply UNDER @function_tool so livekit-agents sees the original signature
+    via functools.wraps / inspect.signature's __wrapped__ follow-through.
+
+    Note: asyncio.wait_for cancels only at await points. Synchronous SQLAlchemy
+    calls (SQLite) are fast enough that this is a safety net, not a hard cap.
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            for attempt in range(retries + 1):
+                try:
+                    return await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)
+                except asyncio.TimeoutError:
+                    return f"Request timed out after {timeout:.0f}s. Please try again."
+                except OperationalError:
+                    if attempt < retries:
+                        await asyncio.sleep(_RETRY_BACKOFF * (2 ** attempt))
+                    else:
+                        return "Database temporarily unavailable. Please try again in a moment."
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -37,6 +75,7 @@ def _truncate(s: str) -> str:
         "(e.g. 'fat loss', 'sleep', 'healing') to find all matching peptides in stock."
     )
 )
+@tool_guard()
 async def check_peptide_stock(
     query: Annotated[str, "Peptide name or health goal/symptom to search for"],
 ) -> str:
@@ -94,6 +133,7 @@ def make_check_available_slots(db: Session):
             "initial_consultation, follow_up, peptide_review, lab_review."
         )
     )
+    @tool_guard()
     async def check_available_slots(
         query: Annotated[
             str,
@@ -169,6 +209,7 @@ def make_check_available_slots(db: Session):
         "insurance, cancellation, new_patient."
     )
 )
+@tool_guard()
 async def answer_faq(
     topic: Annotated[
         str,
@@ -200,6 +241,7 @@ def make_book_appointment(user_id: str, db: Session):
             "Always confirm the slot is available with check_available_slots first."
         )
     )
+    @tool_guard()
     async def book_appointment(
         caller_name: Annotated[str, "Full name of the caller"],
         caller_phone: Annotated[str, "Caller's phone number"],
@@ -280,6 +322,7 @@ def make_cancel_appointment(user_id: str, db: Session):
             "The caller can only cancel their own appointments."
         )
     )
+    @tool_guard()
     async def cancel_appointment(
         appointment_id: Annotated[str, "The full booking ID (UUID) of the appointment to cancel"],
     ) -> str:
@@ -321,6 +364,7 @@ def make_get_appointments(user_id: str, db: Session):
     @function_tool(
         description="List all upcoming appointments for the current caller."
     )
+    @tool_guard()
     async def get_appointments() -> str:
         from models import Appointment
 
