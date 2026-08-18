@@ -1,9 +1,33 @@
-import uuid
+import re
+import uuid as _uuid
 from typing import Annotated
 
 from livekit.agents import function_tool
+from sqlalchemy.orm import Session
 
 import data
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+_SLOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_PHONE_RE = re.compile(r"^[\d\s\+\-\(\)\.x]{7,25}$")
+_APPT_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$|^[0-9a-fA-F\-]{36}$")
+_MAX_QUERY_LEN = 200
+_MAX_OUTPUT_LEN = 1500
+
+
+def _truncate(s: str) -> str:
+    if len(s) <= _MAX_OUTPUT_LEN:
+        return s
+    return s[:_MAX_OUTPUT_LEN] + " … [truncated]"
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
 
 @function_tool(
@@ -16,6 +40,11 @@ import data
 async def check_peptide_stock(
     query: Annotated[str, "Peptide name or health goal/symptom to search for"],
 ) -> str:
+    if not query or not query.strip():
+        return "Please provide a peptide name or health goal."
+    if len(query) > _MAX_QUERY_LEN:
+        return f"Query too long (max {_MAX_QUERY_LEN} characters). Please be more specific."
+
     q = query.lower().strip()
 
     if q in ("all", "list", "everything", "inventory", "stock", "what do you have"):
@@ -24,12 +53,13 @@ async def check_peptide_stock(
             for name, item in data.PEPTIDE_STOCK.items()
             if item["quantity"] > 0
         ]
-        return "In stock: " + ", ".join(in_stock) + "." if in_stock else "No peptides currently in stock."
+        result = "In stock: " + ", ".join(in_stock) + "." if in_stock else "No peptides currently in stock."
+        return _truncate(result)
 
     for name, item in data.PEPTIDE_STOCK.items():
         if name.lower() == q:
             status = f"{item['quantity']} {item['unit']}" if item["quantity"] > 0 else "OUT OF STOCK"
-            return (
+            return _truncate(
                 f"{name}: {item['description']} "
                 f"| In stock: {status} | ${item['price']} per unit."
             )
@@ -42,7 +72,7 @@ async def check_peptide_stock(
             )
 
     if matches:
-        return f"Peptides matching '{query}':\n" + "\n".join(matches)
+        return _truncate(f"Peptides matching '{query}':\n" + "\n".join(matches))
 
     return (
         f"No peptides found matching '{query}'. "
@@ -70,6 +100,11 @@ def make_check_available_slots(db: Session):
             "Date 'YYYY-MM-DD', 'next', or 'week'. Optionally prefix with appointment type, e.g. 'follow_up 2025-09-10'.",
         ],
     ) -> str:
+        if not query or not query.strip():
+            return "Please provide a date ('YYYY-MM-DD'), 'next', or 'week'."
+        if len(query) > 60:
+            return "Query too long. Provide a date ('YYYY-MM-DD'), 'next', or 'week'."
+
         parts = query.strip().lower().split()
 
         appt_type = None
@@ -79,6 +114,13 @@ def make_check_available_slots(db: Session):
                 appt_type = key
                 date_query = " ".join(parts[1:]) if len(parts) > 1 else "week"
                 break
+
+        dq_check = date_query.strip().lower()
+        if dq_check not in ("next", "week") and not _DATE_RE.match(dq_check):
+            return (
+                f"Invalid date or query '{date_query}'. "
+                "Use 'YYYY-MM-DD', 'next', or 'week'."
+            )
 
         type_info = ""
         if appt_type:
@@ -109,7 +151,7 @@ def make_check_available_slots(db: Session):
                 day, time = slot.split(" ")
                 grouped.setdefault(day, []).append(time)
             lines = [f"{day}: {', '.join(times)}" for day, times in grouped.items()]
-            return type_info + "Available slots:\n" + "\n".join(lines)
+            return _truncate(type_info + "Available slots:\n" + "\n".join(lines))
 
         day_slots = sorted(s for s in available if s.startswith(dq))
         if not day_slots:
@@ -136,11 +178,15 @@ async def answer_faq(
         ),
     ],
 ) -> str:
-    answer = data.FAQS.get(topic)
+    if not topic or not topic.strip():
+        return "Please provide a topic. Valid topics: " + ", ".join(data.FAQS.keys()) + "."
+    if len(topic) > 50:
+        return "Topic too long. Choose from: " + ", ".join(data.FAQS.keys()) + "."
+    answer = data.FAQS.get(topic.strip().lower())
     if not answer:
         valid = ", ".join(data.FAQS.keys())
         return f"No FAQ found for '{topic}'. Valid topics: {valid}."
-    return answer
+    return _truncate(answer)
 
 
 def make_book_appointment(user_id: str, db: Session):
@@ -163,6 +209,25 @@ def make_book_appointment(user_id: str, db: Session):
             "Type of appointment: initial_consultation, follow_up, peptide_review, or lab_review",
         ],
     ) -> str:
+        caller_name = caller_name.strip()
+        caller_phone = caller_phone.strip()
+        slot = slot.strip()
+        appointment_type = appointment_type.strip()
+
+        if len(caller_name) < 2 or len(caller_name) > 100:
+            return "Caller name must be between 2 and 100 characters."
+        if any(ord(c) < 32 for c in caller_name):
+            return "Caller name contains invalid characters."
+
+        if not _PHONE_RE.match(caller_phone):
+            return (
+                "Invalid phone number. Use digits, spaces, hyphens, parentheses, "
+                "or a plus sign (7–25 characters)."
+            )
+
+        if not _SLOT_RE.match(slot):
+            return "Slot must be in 'YYYY-MM-DD HH:MM' format (e.g. '2025-09-10 09:00')."
+
         if appointment_type not in data.APPOINTMENT_TYPES:
             valid = ", ".join(data.APPOINTMENT_TYPES.keys())
             return f"Unknown appointment type '{appointment_type}'. Valid types: {valid}."
@@ -178,7 +243,7 @@ def make_book_appointment(user_id: str, db: Session):
         if already_booked:
             return f"Slot '{slot}' is already booked. Please choose another time."
 
-        booking_id = str(uuid.uuid4())
+        booking_id = str(_uuid.uuid4())
         display_id = booking_id[:8].upper()
         appt_type = data.APPOINTMENT_TYPES[appointment_type]
 
@@ -218,6 +283,13 @@ def make_cancel_appointment(user_id: str, db: Session):
     async def cancel_appointment(
         appointment_id: Annotated[str, "The full booking ID (UUID) of the appointment to cancel"],
     ) -> str:
+        appointment_id = appointment_id.strip()
+        if not _APPT_ID_RE.match(appointment_id):
+            return (
+                "Invalid appointment ID format. Provide the 8-character display ID "
+                "or the full UUID from your booking confirmation."
+            )
+
         from models import Appointment
 
         # Support both 8-char display ID prefix and full UUID
@@ -259,6 +331,6 @@ def make_get_appointments(user_id: str, db: Session):
             f"ID: {a.id[:8].upper()} | {a.label} on {a.slot} | {a.caller_name} ({a.caller_phone})"
             for a in appointments
         ]
-        return "Your appointments:\n" + "\n".join(lines)
+        return _truncate("Your appointments:\n" + "\n".join(lines))
 
     return get_appointments

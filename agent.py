@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -74,6 +75,10 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     participant = await ctx.wait_for_participant()
     user_id = participant.identity  # UUID set by FastAPI when issuing LiveKit token
+    try:
+        uuid.UUID(user_id)
+    except (ValueError, AttributeError):
+        return  # Reject unauthenticated or tampered participant identities
 
     db = SessionLocal()
 
