@@ -14,9 +14,12 @@ from livekit.agents import (
 )
 from livekit.plugins import openai, silero
 
+from opentelemetry import trace
+
 import guardrails
 from cost_tracker import SessionCostTracker
 from database import SessionLocal
+from observability import get_tracer, setup_tracing
 from rate_limiter import check_session_rate
 from tools import (
     answer_faq,
@@ -28,6 +31,7 @@ from tools import (
 )
 
 load_dotenv()
+setup_tracing()
 
 logger = logging.getLogger(__name__)
 
@@ -94,26 +98,32 @@ class ReceptionistAgent(Agent):
     ) -> None:
         text = new_message.text_content or ""
 
-        # Guard: prompt injection
-        detected, pattern_label = guardrails.has_prompt_injection(text)
-        if detected:
-            logger.warning(
-                "Prompt injection blocked (pattern=%r) — input: %r",
-                pattern_label,
-                text[:120],
-            )
-            new_message.content = [guardrails.INJECTION_REPLY]
-            return
+        with get_tracer().start_as_current_span("guardrail.check") as span:
+            span.set_attribute("input.length", len(text))
 
-        # Guard: truncate token-stuffing attempts
-        if len(text) > guardrails.MAX_USER_INPUT_CHARS:
-            logger.warning(
-                "User input truncated from %d chars to %d",
-                len(text),
-                guardrails.MAX_USER_INPUT_CHARS,
-            )
-            truncated = text[: guardrails.MAX_USER_INPUT_CHARS]
-            new_message.content = [truncated + guardrails.TRUNCATION_NOTICE]
+            # Guard: prompt injection
+            detected, pattern_label = guardrails.has_prompt_injection(text)
+            span.set_attribute("guardrail.injection_detected", detected)
+            if detected:
+                span.set_attribute("guardrail.pattern", pattern_label or "")
+                logger.warning(
+                    "Prompt injection blocked (pattern=%r) — input: %r",
+                    pattern_label,
+                    text[:120],
+                )
+                new_message.content = [guardrails.INJECTION_REPLY]
+                return
+
+            # Guard: truncate token-stuffing attempts
+            if len(text) > guardrails.MAX_USER_INPUT_CHARS:
+                span.set_attribute("guardrail.truncated", True)
+                logger.warning(
+                    "User input truncated from %d chars to %d",
+                    len(text),
+                    guardrails.MAX_USER_INPUT_CHARS,
+                )
+                truncated = text[: guardrails.MAX_USER_INPUT_CHARS]
+                new_message.content = [truncated + guardrails.TRUNCATION_NOTICE]
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -130,38 +140,58 @@ async def entrypoint(ctx: JobContext) -> None:
 
     db = SessionLocal()
     cost = SessionCostTracker(user_id=user_id)
-    try:
-        session = AgentSession(
-            stt=openai.STT(),
-            llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="alloy"),
-            vad=silero.VAD.load(min_silence_duration=0.3),
-        )
 
-        session.on(
-            "session_usage_updated",
-            lambda ev: cost.update(ev.usage.model_usage),
-        )
-
-        await session.start(
-            room=ctx.room,
-            agent=ReceptionistAgent(user_id=user_id, db=db),
-        )
-
-        await asyncio.sleep(1)
-
-        await session.generate_reply(
-            instructions=(
-                "Greet the caller warmly, introduce yourself as Alex from "
-                "Peptide Wellness Clinic, and ask how you can help them today."
+    with get_tracer().start_as_current_span(
+        "agent.session",
+        attributes={"user.id": user_id, "room.name": ctx.room.name},
+    ) as session_span:
+        try:
+            session = AgentSession(
+                stt=openai.STT(),
+                llm=openai.LLM(model="gpt-4o-mini"),
+                tts=openai.TTS(voice="alloy"),
+                vad=silero.VAD.load(min_silence_duration=0.3),
             )
-        )
-    except Exception:
-        logger.exception("Agent session failed for user %s", user_id)
-        raise
-    finally:
-        cost.log_summary()
-        db.close()
+
+            session.on(
+                "session_usage_updated",
+                lambda ev: cost.update(ev.usage.model_usage),
+            )
+
+            await session.start(
+                room=ctx.room,
+                agent=ReceptionistAgent(user_id=user_id, db=db),
+            )
+
+            await asyncio.sleep(1)
+
+            await session.generate_reply(
+                instructions=(
+                    "Greet the caller warmly, introduce yourself as Alex from "
+                    "Peptide Wellness Clinic, and ask how you can help them today."
+                )
+            )
+        except Exception:
+            logger.exception("Agent session failed for user %s", user_id)
+            session_span.record_exception(
+                Exception(f"Agent session failed for user {user_id}")
+            )
+            session_span.set_status(
+                trace.StatusCode.ERROR, "Agent session failed"
+            )
+            raise
+        finally:
+            cost.log_summary()
+            session_span.set_attribute(
+                "llm.input_tokens", cost.llm_input_tokens
+            )
+            session_span.set_attribute(
+                "llm.output_tokens", cost.llm_output_tokens
+            )
+            session_span.set_attribute(
+                "llm.estimated_cost_usd", cost.estimated_cost_usd
+            )
+            db.close()
 
 
 if __name__ == "__main__":

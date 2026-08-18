@@ -6,10 +6,12 @@ import uuid as _uuid
 from typing import Annotated
 
 from livekit.agents import function_tool
+from opentelemetry import trace
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 import data
+from observability import get_tracer
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +54,34 @@ def tool_guard(timeout: float = _TOOL_TIMEOUT, retries: int = _TOOL_RETRIES):
     def decorator(fn):
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
-            for attempt in range(retries + 1):
-                try:
-                    return await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)
-                except asyncio.TimeoutError:
-                    return f"Request timed out after {timeout:.0f}s. Please try again."
-                except OperationalError:
-                    if attempt < retries:
-                        await asyncio.sleep(_RETRY_BACKOFF * (2 ** attempt))
-                    else:
-                        return "Database temporarily unavailable. Please try again in a moment."
-                except Exception:
-                    logger.exception("Unhandled error in tool %s", fn.__name__)
-                    return "An unexpected error occurred. Please try again."
+            with get_tracer().start_as_current_span(
+                f"tool.{fn.__name__}",
+                attributes={"tool.name": fn.__name__},
+            ) as span:
+                for attempt in range(retries + 1):
+                    span.set_attribute("tool.attempt", attempt)
+                    try:
+                        result = await asyncio.wait_for(
+                            fn(*args, **kwargs), timeout=timeout
+                        )
+                        span.set_attribute("tool.success", True)
+                        return result
+                    except asyncio.TimeoutError:
+                        span.set_attribute("tool.timed_out", True)
+                        span.set_status(trace.StatusCode.ERROR, "timeout")
+                        return f"Request timed out after {timeout:.0f}s. Please try again."
+                    except OperationalError:
+                        span.set_attribute("tool.db_error", True)
+                        if attempt < retries:
+                            await asyncio.sleep(_RETRY_BACKOFF * (2 ** attempt))
+                        else:
+                            span.set_status(trace.StatusCode.ERROR, "db_unavailable")
+                            return "Database temporarily unavailable. Please try again in a moment."
+                    except Exception:
+                        logger.exception("Unhandled error in tool %s", fn.__name__)
+                        span.record_exception(Exception(f"Unhandled error in {fn.__name__}"))
+                        span.set_status(trace.StatusCode.ERROR, "unexpected_error")
+                        return "An unexpected error occurred. Please try again."
         return wrapper
     return decorator
 

@@ -3,15 +3,22 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
 load_dotenv()
 
 from database import Base, engine
+from observability import setup_tracing
 from routers import auth_routes, appointment_routes, livekit_routes
+
+setup_tracing()
+SQLAlchemyInstrumentor().instrument(engine=engine)
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Peptide Voice Agent API")
+FastAPIInstrumentor.instrument_app(app)
 
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 
