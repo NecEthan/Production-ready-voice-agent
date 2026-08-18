@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import logging
 import re
 import uuid as _uuid
 from typing import Annotated
@@ -9,6 +10,8 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 import data
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Validation helpers
@@ -59,6 +62,9 @@ def tool_guard(timeout: float = _TOOL_TIMEOUT, retries: int = _TOOL_RETRIES):
                         await asyncio.sleep(_RETRY_BACKOFF * (2 ** attempt))
                     else:
                         return "Database temporarily unavailable. Please try again in a moment."
+                except Exception:
+                    logger.exception("Unhandled error in tool %s", fn.__name__)
+                    return "An unexpected error occurred. Please try again."
         return wrapper
     return decorator
 
@@ -300,8 +306,13 @@ def make_book_appointment(user_id: str, db: Session):
             duration_min=appt_type["duration_min"],
             price=appt_type["price"],
         )
-        db.add(appointment)
-        db.commit()
+        try:
+            db.add(appointment)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to commit booking for slot %s", slot)
+            return "Failed to save your appointment due to a database error. Please try again."
 
         return (
             f"Appointment confirmed! Booking ID: {display_id}. "
@@ -351,8 +362,14 @@ def make_cancel_appointment(user_id: str, db: Session):
         if appointment.user_id != user_id:
             return "You are not authorised to cancel that appointment."
 
-        db.delete(appointment)
-        db.commit()
+        try:
+            db.delete(appointment)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to cancel appointment %s", appointment_id)
+            return "Failed to cancel your appointment due to a database error. Please try again."
+
         return f"Appointment {appointment_id.upper()} has been cancelled."
 
     return cancel_appointment

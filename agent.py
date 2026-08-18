@@ -1,7 +1,10 @@
 import asyncio
+import logging
 import uuid
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -81,27 +84,32 @@ async def entrypoint(ctx: JobContext) -> None:
         return  # Reject unauthenticated or tampered participant identities
 
     db = SessionLocal()
-
-    session = AgentSession(
-        stt=openai.STT(),
-        llm=openai.LLM(model="gpt-4o-mini"),
-        tts=openai.TTS(voice="alloy"),
-        vad=silero.VAD.load(min_silence_duration=0.3),
-    )
-
-    await session.start(
-        room=ctx.room,
-        agent=ReceptionistAgent(user_id=user_id, db=db),
-    )
-
-    await asyncio.sleep(1)
-
-    await session.generate_reply(
-        instructions=(
-            "Greet the caller warmly, introduce yourself as Alex from "
-            "Peptide Wellness Clinic, and ask how you can help them today."
+    try:
+        session = AgentSession(
+            stt=openai.STT(),
+            llm=openai.LLM(model="gpt-4o-mini"),
+            tts=openai.TTS(voice="alloy"),
+            vad=silero.VAD.load(min_silence_duration=0.3),
         )
-    )
+
+        await session.start(
+            room=ctx.room,
+            agent=ReceptionistAgent(user_id=user_id, db=db),
+        )
+
+        await asyncio.sleep(1)
+
+        await session.generate_reply(
+            instructions=(
+                "Greet the caller warmly, introduce yourself as Alex from "
+                "Peptide Wellness Clinic, and ask how you can help them today."
+            )
+        )
+    except Exception:
+        logger.exception("Agent session failed for user %s", user_id)
+        raise
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
